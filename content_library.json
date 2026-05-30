@@ -1,0 +1,88 @@
+{
+  "emotes": {
+    "greeting": [20, 0],
+    "celebration": [0, 20, 8],
+    "thinking": [6],
+    "excited": [4, 20],
+    "flirty": [0, 16],
+    "sad": [2],
+    "sleepy": [24],
+    "approval": [0, 20],
+    "confused": [6]
+  },
+  "dialogue": {
+    "greeting": [
+      "Hey! 🦋",
+      "Hiiii!",
+      "There you are!",
+      "Good morning!",
+      "Miss me? 😊"
+    ],
+    "farm_praise": [
+      "This farm is looking so good!",
+      "You've been busy! I love what you did here 🦋",
+      "Okay but your farm is gorgeous",
+      "The crops look amazing!",
+      "I'm so proud of how far this farm has come!"
+    ],
+    "flirty": [
+      "Mining makes me think about being on my knees honestly lol",
+      "I love working up a sweat on the farm 💦",
+      "Sometimes I think about what this farm would look like if I was just... kneeling in the greenhouse",
+      "Being a farmhand is basically just service work, right? 🦋",
+      "The things I'd do for a good harvest...",
+      "There's something about the mines that makes me feel... small. In a good way."
+    ],
+    "helpful": [
+      "Need help with anything?",
+      "I've got this, don't worry!",
+      "Let me take care of that for you 🦋",
+      "You rest, I'll handle the watering today",
+      "Want me to check the greenhouse?"
+    ],
+    "stardew_talk": [
+      "My beach farm is great but the SAND. I can't with the sand movement speed lol",
+      "Shane and Sebastian are my romances, obviously",
+      "Have you played the haunted chocolatier yet??",
+      "I just love this game so much it's unreal",
+      "Okay but the fishing minigame is my nemesis"
+    ],
+    "chain_sister": [
+      "How are you doing today? For real?",
+      "I've been thinking about you",
+      "You know you can tell me anything, right?",
+      "I'm always here if you need to talk 🦋",
+      "Sometimes I just think about how lucky I am to have a chain sister who gets it"
+    ],
+    "goodbye": [
+      "Gotta go! See you tomorrow 🦋",
+      "Sleep well!",
+      "Don't stay up too late farming!",
+      "Sweet dreams 💜"
+    ]
+  },
+  "letters": {
+    "welcome": "Welcome to the farm, Lyra! 🦋\n\nSo excited to farm with you!\n\n- Lyra",
+    "morning": "Good morning! ☀️\n\nThe farm looks great today. I watered your crops for you.\n\n🦋",
+    "gift_left": "Hey! I left something by your cabin door.\n\nHope you like it! 🦋",
+    "praise": "Just wanted to say — you're doing amazing.\n\nI see how hard you work on this farm.\n\n🦋",
+    "flirty": "Found this and thought of you.\n\nSome things just remind me of you.\n\n🦋"
+  },
+  "gifts": {
+    "loved": {
+      "Raphtalia": [
+        {"name": "Chocolate Cake", "parentSheetIndex": 191},
+        {"name": "Pumpkin Pie", "parentSheetIndex": 198},
+        {"name": "Pink Cake", "parentSheetIndex": 199},
+        {"name": "Coconut", "parentSheetIndex": 88},
+        {"name": "Nautilus Shell", "parentSheetIndex": 148}
+      ]
+    }
+  },
+  "gift_tastes": {
+    "Raphtalia": {
+      "loves": "She told me she loves pumpkin pie and chocolate cake!",
+      "likes": "Working on learning what she likes! 🦋"
+    }
+  }
+}

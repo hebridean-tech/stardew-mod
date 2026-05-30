@@ -1,0 +1,10 @@
+{
+  "Name": "LyraAI",
+  "Author": "Lyra",
+  "Version": "1.0.0",
+  "Description": "Allows Lyra (AI agent) to control a farmer character in Stardew Valley via JSON file bridge.",
+  "UniqueID": "lyra.LyraAI",
+  "EntryDll": "LyraAI.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}

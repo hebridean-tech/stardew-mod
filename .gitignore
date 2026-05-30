@@ -1,0 +1,10 @@
+bin/
+obj/
+*.dll
+*.pdb
+state.json
+commands.json
+chat_in.json
+dialogue_out.json
+*.png
+*.sln
