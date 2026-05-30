@@ -37,6 +37,12 @@ namespace LyraAI
         private int _pathCooldown = 0;
         private bool _pathFailed = false;
 
+        // Natural movement personality (Phase 1)
+        private readonly Random _rand = new();
+        private int _pauseTicks = 0;           // >0 means pause movement for natural "hesitation"
+        private DateTime _lastPersonalityEmote = DateTime.UtcNow;
+        private readonly HashSet<string> _prevNearbyNames = new(); // for reactive emotes on player enter/leave
+
         // Follow command state
         private string _following = null; // target farmer name, null = not following
 
@@ -78,6 +84,18 @@ namespace LyraAI
             // Hook into multiplayer chat for capture
             helper.Events.Multiplayer.ModMessageReceived += OnModMessageReceived;
             helper.Events.GameLoop.DayStarted += OnDayStarted;
+
+            // Debug/test console commands (use in SMAPI console during play to verify functionality)
+            helper.ConsoleCommands.Add("lyra_test_chat", "Send test chat message using the mod's SendChatMessage (verify it appears for host)", (cmd, args) =>
+            {
+                string msg = args.Length > 0 ? string.Join(" ", args) : "Lyra test chat 🦋";
+                SendChatMessage(msg);
+                Monitor.Log($"[lyra_test_chat] Sent: {msg}", LogLevel.Alert);
+            });
+            helper.ConsoleCommands.Add("lyra_status", "Print current LyraAI internal state (following, moving, path status)", (cmd, args) =>
+            {
+                Monitor.Log($"[lyra_status] following={_following ?? "none"} isMoving={_isMoving} pathFailed={_pathFailed} pathCooldown={_pathCooldown} loc={Game1.currentLocation?.Name}", LogLevel.Alert);
+            });
         }
 
         private void OnDayStarted(object sender, DayStartedEventArgs e)
@@ -88,6 +106,9 @@ namespace LyraAI
             _isMoving = false;
             _pathCooldown = 0;
             _pathFailed = false;
+            _pauseTicks = 0;
+            _lastPersonalityEmote = DateTime.UtcNow;
+            _prevNearbyNames.Clear();
         }
 
         private void EnsureFile(string path, string defaultContent)
@@ -96,6 +117,25 @@ namespace LyraAI
             {
                 try { File.WriteAllText(path, defaultContent); }
                 catch (Exception ex) { Monitor.Log($"Failed to create {path}: {ex.Message}", LogLevel.Warn); }
+            }
+        }
+
+        /// <summary>
+        /// Atomic write: write to temp file then rename. Prevents partial/corrupt state.json on crash or interrupt.
+        /// </summary>
+        private void AtomicWriteFile(string path, string content)
+        {
+            string tmpPath = path + ".tmp";
+            try
+            {
+                File.WriteAllText(tmpPath, content);
+                File.Move(tmpPath, path, overwrite: true);
+            }
+            catch (Exception ex)
+            {
+                Monitor.Log($"AtomicWrite failed for {path}: {ex.Message}", LogLevel.Warn);
+                // Fallback to direct write
+                try { File.WriteAllText(path, content); } catch { }
             }
         }
 
@@ -240,7 +280,7 @@ namespace LyraAI
                                 if (existing.Count > 200)
                                     existing = existing.TakeLast(200).ToList();
 
-                                File.WriteAllText(ChatInPath, "[" + string.Join(",", existing) + "]");
+                                AtomicWriteFile(ChatInPath, "[" + string.Join(",", existing) + "]");
                             }
                         }
                     }
@@ -351,8 +391,8 @@ namespace LyraAI
 
                 if (commands.Count == 0) return;
 
-                // Clear the file to avoid re-processing
-                File.WriteAllText(CommandsPath, "{\"commands\":[]}");
+                // Clear the file to avoid re-processing (atomic for safety)
+                AtomicWriteFile(CommandsPath, "{\"commands\":[]}");
                 _lastCommandTime = DateTime.UtcNow;
 
                 foreach (var cmd in commands)
@@ -433,9 +473,10 @@ namespace LyraAI
         }
 
         /// <summary>
-        /// Assigns a PathFindController to the player for obstacle-aware navigation.
-        /// Uses reflection since PathFindController may be internal in some versions.
-        /// Falls back to straight-line movement if pathfinding fails.
+        /// Assigns a PathFindController to the player for obstacle-aware navigation (robust reflection across SDV 1.6.x builds).
+        /// Tries multiple constructor signatures (4-param, 5-param, any viable). Clears stale controller first.
+        /// Falls back to straight-line movement (in OnUpdateTicked) if reflection fails.
+        /// Arrival detection: stops within 0.5 tiles of target.
         /// </summary>
         private bool TrySetPath(Point target)
         {
@@ -445,43 +486,97 @@ namespace LyraAI
             var location = Game1.currentLocation;
             if (player == null || location == null) return false;
 
+            // Always clear existing controller before assigning new path (prevents stale paths)
+            try { player.controller = null; } catch { }
+
             try
             {
-                // Find PathFindController type via reflection (handles internal/non-public classes)
+                // Reflection: find the type (handles internal/non-public classes in SDV 1.6.x)
                 var pfcType = typeof(Game1).Assembly.GetType("StardewValley.PathFindController")
                     ?? typeof(Game1).Assembly.GetType("StardewValley.GamePathFinder.PathFindController");
 
                 if (pfcType != null)
                 {
-                    // Find constructor: (Character character, GameLocation location, Point targetTile, int facingDirection)
-                    var ctor = pfcType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
-                        .FirstOrDefault(c =>
-                        {
-                            var p = c.GetParameters();
-                            return p.Length == 4
-                                && p[0].ParameterType == typeof(Character)
-                                && p[1].ParameterType == typeof(GameLocation);
-                        });
+                    var ctors = pfcType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
 
-                    if (ctor != null)
+                    // Try common 4-param: (Character, GameLocation, Point, int facing)
+                    var ctor4 = ctors.FirstOrDefault(c =>
                     {
-                        var pathController = ctor.Invoke(new object[] { player, location, target, 2 });
-                        // Set controller on the player (Character.controller property)
-                        var controllerProp = typeof(Character).GetProperty("controller",
-                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                        if (controllerProp != null)
+                        var p = c.GetParameters();
+                        return p.Length == 4
+                            && p[0].ParameterType == typeof(Character)
+                            && p[1].ParameterType == typeof(GameLocation)
+                            && p[2].ParameterType == typeof(Point)
+                            && (p[3].ParameterType == typeof(int) || p[3].ParameterType == typeof(int));
+                    });
+
+                    if (ctor4 != null)
+                    {
+                        var pfc = ctor4.Invoke(new object[] { player, location, target, 2 });
+                        var ctrlProp = typeof(Character).GetProperty("controller", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        ctrlProp?.SetValue(player, pfc);
+                        _pathCooldown = 4;
+                        _pathFailed = false;
+                        Monitor.Log($"Pathfinding (refl-4) to ({target.X}, {target.Y}) via {pfcType.FullName}", LogLevel.Debug);
+                        return true;
+                    }
+
+                    // Try 5-param variants seen in some decompiles: (Character, GameLocation, Point, int, bool finalFacing or something)
+                    var ctor5 = ctors.FirstOrDefault(c =>
+                    {
+                        var p = c.GetParameters();
+                        return p.Length == 5
+                            && p[0].ParameterType == typeof(Character)
+                            && p[1].ParameterType == typeof(GameLocation)
+                            && p[2].ParameterType == typeof(Point);
+                    });
+
+                    if (ctor5 != null)
+                    {
+                        var pfc = ctor5.Invoke(new object[] { player, location, target, 2, false });
+                        var ctrlProp = typeof(Character).GetProperty("controller", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        ctrlProp?.SetValue(player, pfc);
+                        _pathCooldown = 4;
+                        _pathFailed = false;
+                        Monitor.Log($"Pathfinding (refl-5) to ({target.X}, {target.Y})", LogLevel.Debug);
+                        return true;
+                    }
+
+                    // Fallback: any ctor with at least Character + GameLocation + Point, pad with defaults
+                    var ctorAny = ctors.FirstOrDefault(c =>
+                    {
+                        var p = c.GetParameters();
+                        return p.Length >= 3
+                            && p[0].ParameterType == typeof(Character)
+                            && p[1].ParameterType == typeof(GameLocation)
+                            && p[2].ParameterType == typeof(Point);
+                    });
+
+                    if (ctorAny != null)
+                    {
+                        var parms = ctorAny.GetParameters();
+                        var args = new object[parms.Length];
+                        args[0] = player;
+                        args[1] = location;
+                        args[2] = target;
+                        for (int i = 3; i < parms.Length; i++)
                         {
-                            controllerProp.SetValue(player, pathController);
-                            _pathCooldown = 4;
-                            _pathFailed = false;
-                            Monitor.Log($"Pathfinding to ({target.X}, {target.Y}) via {pfcType.FullName}", LogLevel.Debug);
-                            return true;
+                            if (parms[i].ParameterType == typeof(int)) args[i] = 2;
+                            else if (parms[i].ParameterType == typeof(bool)) args[i] = false;
+                            else args[i] = parms[i].DefaultValue != DBNull.Value ? parms[i].DefaultValue : null;
                         }
+                        var pfc = ctorAny.Invoke(args);
+                        var ctrlProp = typeof(Character).GetProperty("controller", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        ctrlProp?.SetValue(player, pfc);
+                        _pathCooldown = 4;
+                        _pathFailed = false;
+                        Monitor.Log($"Pathfinding (refl-any) to ({target.X}, {target.Y})", LogLevel.Debug);
+                        return true;
                     }
                 }
 
-                // Fallback: couldn't find PathFindController — try direct new if it's public
-                Monitor.Log($"Pathfinding reflection failed — will use straight-line movement", LogLevel.Warn);
+                // All reflection attempts failed — fall back to straight-line in movement tick
+                Monitor.Log($"PathFindController not found/constructable — straight-line fallback active for ({target.X},{target.Y})", LogLevel.Warn);
                 _pathFailed = true;
                 _pathCooldown = 4;
                 return false;
@@ -989,6 +1084,73 @@ namespace LyraAI
                 else if (Game1.isSnowing) weather = "Snowy";
                 else if (Game1.weatherIcon == 12) weather = "Windy";
 
+                // ── Phase 1: Crop/farm scanning (unwatered HoeDirt + IndoorPots) ──
+                // Lets Lyra know WHERE crops need water, not just "near me"
+                var unwateredCrops = new List<object>();
+                var exits = new List<object>();
+                try
+                {
+                    if (location != null)
+                    {
+                        int scanLimit = 25;
+                        var playerTile = player.Position / Game1.tileSize;
+
+                        // Scan terrainFeatures (most crops)
+                        foreach (var kv in location.terrainFeatures.Pairs)
+                        {
+                            if (kv.Value is StardewValley.TerrainFeatures.HoeDirt dirt && dirt.state.Value == 0)
+                            {
+                                int cx = (int)kv.Key.X;
+                                int cy = (int)kv.Key.Y;
+                                unwateredCrops.Add(new { x = cx, y = cy });
+                                if (unwateredCrops.Count >= scanLimit) break;
+                            }
+                        }
+
+                        // Also scan IndoorPots (greenhouse, sheds, etc.)
+                        if (unwateredCrops.Count < scanLimit)
+                        {
+                            foreach (var kv in location.Objects.Pairs)
+                            {
+                                if (kv.Value is StardewValley.Objects.IndoorPot pot &&
+                                    pot.hoeDirt.Value != null && pot.hoeDirt.Value.state.Value == 0)
+                                {
+                                    int cx = (int)kv.Key.X;
+                                    int cy = (int)kv.Key.Y;
+                                    unwateredCrops.Add(new { x = cx, y = cy });
+                                    if (unwateredCrops.Count >= scanLimit) break;
+                                }
+                            }
+                        }
+
+                        // ── Basic area transition support: report exits/warps (Phase 1 foundation) ──
+                        // AI can path to an exit tile then issue move/warp or use edge detection
+                        try
+                        {
+                            if (location.warps != null)
+                            {
+                                foreach (var w in location.warps)
+                                {
+                                    exits.Add(new
+                                    {
+                                        x = w.X,
+                                        y = w.Y,
+                                        targetLocation = w.TargetName,
+                                        targetX = w.TargetX,
+                                        targetY = w.TargetY
+                                    });
+                                    if (exits.Count >= 8) break;
+                                }
+                            }
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception scanEx)
+                {
+                    Monitor.Log($"Crop/exit scan error: {scanEx.Message}", LogLevel.Trace);
+                }
+
                 var state = new
                 {
                     timestamp = DateTime.UtcNow.ToString("o"),
@@ -1012,11 +1174,19 @@ namespace LyraAI
                         year = Game1.year,
                         time = Game1.timeOfDay,
                         weather
+                    },
+                    farm = new
+                    {
+                        unwateredCrops,
+                        exits,  // warp/exit points for area transitions (Phase 1)
+                        scannedLocation = location?.Name ?? "Unknown",
+                        cropCount = unwateredCrops.Count,
+                        exitCount = exits.Count
                     }
                 };
 
                 string json = JsonSerializer.Serialize(state, JsonOpts);
-                File.WriteAllText(StatePath, json);
+                AtomicWriteFile(StatePath, json);
             }
             catch (Exception ex)
             {
@@ -1056,10 +1226,11 @@ namespace LyraAI
 
                 if (target != null && target.currentLocation != null)
                 {
-                    // Move to target's location if different
+                    // Move to target's location if different (CRITICAL: warpFarmer can cause visual desync for host in MP)
+                    // TODO Phase1: replace with "walk to map edge + normal transition" for production reliability
                     if (player.currentLocation != target.currentLocation)
                     {
-                        // Use Game1.warpFarmer static method to change locations
+                        Monitor.Log($"[FOLLOW] Cross-location warp to follow '{_following}' into {target.currentLocation.Name} (possible host desync risk)", LogLevel.Warn);
                         try
                         {
                             Game1.warpFarmer(
@@ -1068,10 +1239,15 @@ namespace LyraAI
                                 (int)(target.Position.Y / Game1.tileSize),
                                 false
                             );
+                            // Clear movement state post-warp to let game settle
+                            player.movementDirections?.Clear();
+                            player.controller = null;
+                            _isMoving = false;
+                            _pathCooldown = 8; // brief pause after warp
                         }
                         catch (Exception warpEx)
                         {
-                            Monitor.Log($"Follow warp failed: {warpEx.Message}", LogLevel.Trace);
+                            Monitor.Log($"Follow warp failed: {warpEx.Message}", LogLevel.Warn);
                         }
                     }
 
@@ -1099,6 +1275,19 @@ namespace LyraAI
                         _isMoving = false;
                         player.movementDirections.Clear();
                         player.controller = null;
+                        // Natural: face the player when standing nearby (personality)
+                        try
+                        {
+                            int faceDir = GetDirectionTo(player, target);
+                            player.faceDirection(faceDir);
+                        }
+                        catch { }
+                        // Occasional friendly emote when close and idle
+                        if ((DateTime.UtcNow - _lastPersonalityEmote).TotalSeconds > 45 && _rand.Next(3) == 0)
+                        {
+                            Game1.player.doEmote(20); // happy
+                            _lastPersonalityEmote = DateTime.UtcNow;
+                        }
                     }
                 }
                 else
@@ -1111,36 +1300,54 @@ namespace LyraAI
                 }
             }
 
-            // ── Movement (follow or explicit move command) ──
+            // ── Movement (follow or explicit move command) + natural personality ──
             if (_isMoving)
             {
-                Vector2 currentTile = player.Position / Game1.tileSize;
-                float dist = Vector2.Distance(currentTile, _moveTarget);
-
-                if (dist < 0.5f)
+                // Natural pause/hesitation (Phase 1 personality): occasionally stop for a few ticks
+                if (_pauseTicks > 0)
                 {
-                    // Arrived at destination
-                    _isMoving = false;
+                    _pauseTicks--;
                     player.movementDirections.Clear();
                     player.controller = null;
                 }
-                else if (player.controller == null && !_pathFailed)
+                else
                 {
-                    // PathFindController completed or was cleared — retry pathfinding
-                    TrySetPath(new Point((int)_moveTarget.X, (int)_moveTarget.Y));
-                }
-                else if (_pathFailed && player.controller == null)
-                {
-                    // Fallback: straight-line movement when pathfinding fails
-                    Vector2 dir = _moveTarget - currentTile;
-                    float dx = dir.X;
-                    float dy = dir.Y;
+                    Vector2 currentTile = player.Position / Game1.tileSize;
+                    float dist = Vector2.Distance(currentTile, _moveTarget);
 
-                    player.movementDirections.Clear();
-                    if (dx > 0.3f) player.movementDirections.Add(1);
-                    else if (dx < -0.3f) player.movementDirections.Add(3);
-                    if (dy > 0.3f) player.movementDirections.Add(2);
-                    else if (dy < -0.3f) player.movementDirections.Add(0);
+                    if (dist < 0.5f)
+                    {
+                        // Arrived at destination
+                        _isMoving = false;
+                        player.movementDirections.Clear();
+                        player.controller = null;
+                        // Face "forward" or last direction naturally
+                        if (_rand.Next(4) == 0) player.faceDirection(_rand.Next(4));
+                    }
+                    else if (player.controller == null && !_pathFailed)
+                    {
+                        // PathFindController completed or was cleared — retry pathfinding
+                        TrySetPath(new Point((int)_moveTarget.X, (int)_moveTarget.Y));
+                    }
+                    else if (_pathFailed && player.controller == null)
+                    {
+                        // Fallback: straight-line movement when pathfinding fails
+                        Vector2 dir = _moveTarget - currentTile;
+                        float dx = dir.X;
+                        float dy = dir.Y;
+
+                        player.movementDirections.Clear();
+                        if (dx > 0.3f) player.movementDirections.Add(1);
+                        else if (dx < -0.3f) player.movementDirections.Add(3);
+                        if (dy > 0.3f) player.movementDirections.Add(2);
+                        else if (dy < -0.3f) player.movementDirections.Add(0);
+
+                        // Occasional micro-pause while traveling (makes movement feel less robotic)
+                        if (_rand.Next(100) < 4) // ~4% chance per update tick
+                        {
+                            _pauseTicks = _rand.Next(6, 14); // 6-14 ticks pause (~0.4-0.9s)
+                        }
+                    }
                 }
             }
 
@@ -1157,6 +1364,50 @@ namespace LyraAI
                 }
             }
 
+            // ── Reactive emotes (Phase 1): react to players entering/leaving area ──
+            try
+            {
+                var currentNearby = new HashSet<string>();
+                if (Game1.currentLocation?.farmers != null)
+                {
+                    foreach (var f in Game1.currentLocation.farmers)
+                    {
+                        if (f != null && f != Game1.player && !string.IsNullOrEmpty(f.Name))
+                            currentNearby.Add(f.Name);
+                    }
+                }
+
+                // New player(s) arrived
+                foreach (var name in currentNearby)
+                {
+                    if (!_prevNearbyNames.Contains(name))
+                    {
+                        // Friendly reactive emote on join (heart or happy)
+                        if (Game1.player != null)
+                        {
+                            int em = (name.Contains("Raphtalia", StringComparison.OrdinalIgnoreCase) || _rand.Next(2)==0) ? 0 : 20;
+                            Game1.player.doEmote(em);
+                            _lastPersonalityEmote = DateTime.UtcNow;
+                        }
+                        Monitor.Log($"[REACTIVE] {name} entered area — emote", LogLevel.Debug);
+                    }
+                }
+
+                // Player left (optional sad emote, low freq)
+                foreach (var old in _prevNearbyNames)
+                {
+                    if (!currentNearby.Contains(old) && _rand.Next(4) == 0)
+                    {
+                        if (Game1.player != null) Game1.player.doEmote(2); // sad
+                        Monitor.Log($"[REACTIVE] {old} left area", LogLevel.Debug);
+                    }
+                }
+
+                _prevNearbyNames.Clear();
+                foreach (var n in currentNearby) _prevNearbyNames.Add(n);
+            }
+            catch { }
+
             // ── Chat capture on update tick ──
             CaptureChatMessages();
         }
@@ -1169,6 +1420,19 @@ namespace LyraAI
             int[] emotes = { 0, 4, 8, 16, 20, 32 };
             int emote = emotes[rnd.Next(emotes.Length)];
             Game1.player.doEmote(emote);
+        }
+
+        /// <summary>
+        /// Compute facing direction (0=up,1=right,2=down,3=left) from player toward target.
+        /// Used for natural "face the player" behavior.
+        /// </summary>
+        private int GetDirectionTo(Farmer from, Farmer to)
+        {
+            if (from == null || to == null) return 2;
+            Vector2 delta = to.Position - from.Position;
+            if (Math.Abs(delta.X) > Math.Abs(delta.Y))
+                return delta.X > 0 ? 1 : 3;
+            return delta.Y > 0 ? 2 : 0;
         }
 
         protected override void Dispose(bool disposing)
