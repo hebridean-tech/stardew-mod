@@ -475,6 +475,15 @@ namespace LyraAI
                             case "forage":
                                 HandleForage(cmd);
                                 break;
+                            case "autonomous_water":
+                                HandleAutonomousWater(cmd);
+                                break;
+                            case "start_autonomy":
+                                HandleStartAutonomy(cmd);
+                                break;
+                            case "stop_autonomy":
+                                HandleStopAutonomy(cmd);
+                                break;
                             case "waitforevent":
                                 // No-op: just resets idle timer
                                 break;
@@ -1274,6 +1283,57 @@ namespace LyraAI
                 Monitor.Log("Nothing to forage nearby", LogLevel.Trace);
         }
 
+        // ─── Autonomy Layer (Phase 2 - Token Light) ───
+        private void HandleAutonomousWater(JsonElement cmd)
+        {
+            // High-level command: "just water whatever is nearby"
+            // For now, re-use the existing water logic but in a wider area
+            if (!Context.IsWorldReady || Game1.player == null) return;
+
+            var player = Game1.player;
+            var location = Game1.currentLocation;
+
+            int watered = 0;
+            int px = (int)(player.Position.X / Game1.tileSize);
+            int py = (int)(player.Position.Y / Game1.tileSize);
+
+            for (int dx = -6; dx <= 6; dx++)
+            {
+                for (int dy = -6; dy <= 6; dy++)
+                {
+                    int tx = px + dx;
+                    int ty = py + dy;
+                    var tilePos = new Vector2(tx, ty);
+
+                    if (location.terrainFeatures.TryGetValue(tilePos, out var feature) &&
+                        feature is StardewValley.TerrainFeatures.HoeDirt dirt && dirt.state.Value == 0)
+                    {
+                        dirt.state.Value = 1;
+                        watered++;
+                    }
+                }
+            }
+
+            Monitor.Log($"[Autonomy] Auto-watered {watered} tiles", LogLevel.Debug);
+        }
+
+        private void HandleStartAutonomy(JsonElement cmd)
+        {
+            // The real autonomy logic will live in Python.
+            // The mod just sets a flag so the state reflects "I'm in autonomous mode".
+            _autonomyMode = true;
+            Monitor.Log("[Autonomy] Autonomous mode enabled (Python layer will drive decisions)", LogLevel.Debug);
+        }
+
+        private void HandleStopAutonomy(JsonElement cmd)
+        {
+            _autonomyMode = false;
+            Monitor.Log("[Autonomy] Autonomous mode disabled", LogLevel.Debug);
+        }
+
+        // Simple flag the Python side can read
+        private bool _autonomyMode = false;
+
         // ─── Dialogue Polling (every 2s) ───
         private async Task PollDialogueLoop(CancellationToken ct)
         {
@@ -1490,7 +1550,9 @@ namespace LyraAI
                         // New: Very lightweight chest info for agency (minimal token impact)
                         nearbyChests = GetNearbyChestsSummary(location, player.Position / Game1.tileSize),
                         // New: Lightweight foraging info (for agency with minimal tokens)
-                        forage = GetForageSummary(location, player.Position / Game1.tileSize)
+                        forage = GetForageSummary(location, player.Position / Game1.tileSize),
+                        // Autonomy opportunities (very lightweight for token efficiency)
+                        autonomy = GetAutonomyOpportunities(location, player.Position / Game1.tileSize, player)
                     }
                 };
 
@@ -2239,6 +2301,81 @@ namespace LyraAI
             {
                 count,
                 summary = count > 0 ? $"{count} forageables ({summary})" : "none nearby"
+            };
+        }
+
+        /// <summary>
+        /// Returns very lightweight autonomy opportunities.
+        /// Designed to be tiny in state.json — real decision logic lives in Python.
+        /// </summary>
+        private object GetAutonomyOpportunities(GameLocation location, Vector2 playerTile, Farmer player)
+        {
+            var opportunities = new List<string>();
+
+            // Watering opportunity (reuses existing crop scan data)
+            int unwateredNearby = 0;
+            try
+            {
+                if (location != null)
+                {
+                    foreach (var kv in location.terrainFeatures.Pairs)
+                    {
+                        if (kv.Value is StardewValley.TerrainFeatures.HoeDirt dirt && dirt.state.Value == 0)
+                        {
+                            float dist = Vector2.Distance(playerTile, kv.Key);
+                            if (dist <= 8) unwateredNearby++;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            if (unwateredNearby >= 3)
+                opportunities.Add("water_crops");
+
+            // Foraging opportunity (reuses the forage summary we already compute)
+            // We can check the existing forage data, but for simplicity we approximate here
+            if (opportunities.Count < 3) // keep it small
+            {
+                // Quick debris scan
+                try
+                {
+                    var debrisField = typeof(GameLocation).GetField("debris",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    var debrisList = debrisField?.GetValue(location) as System.Collections.IList;
+                    int forageCount = 0;
+
+                    if (debrisList != null)
+                    {
+                        foreach (var d in debrisList)
+                        {
+                            // Simplified check — real logic is in GetForageSummary
+                            forageCount++;
+                            if (forageCount >= 4) break;
+                        }
+                    }
+                    if (forageCount >= 3)
+                        opportunities.Add("forage");
+                }
+                catch { }
+            }
+
+            // Chest organization opportunity (very rough)
+            if (player.Items != null)
+            {
+                int itemCount = player.Items.Count(i => i != null);
+                if (itemCount > 8)
+                    opportunities.Add("organize_inventory");
+            }
+
+            string primary = opportunities.Count > 0 ? opportunities[0] : "idle";
+
+            return new
+            {
+                opportunities,
+                primary_suggestion = primary,
+                idle_level = opportunities.Count == 0 ? "high" : "medium",
+                autonomy_mode = _autonomyMode
             };
         }
 

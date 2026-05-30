@@ -243,6 +243,16 @@ def build_summary(state: Dict[str, Any], focus: str = "full", compact: bool = Fa
     if forage and forage.get("count", 0) > 0:
         summary["forage"] = forage.get("summary", f"{forage.get('count')} forageables nearby")
 
+    # Autonomy opportunities (very token-light, intelligence lives here in Python)
+    autonomy = farm.get("autonomy", {})
+    if autonomy:
+        summary["autonomy"] = {
+            "mode": "on" if autonomy.get("autonomy_mode") else "off",
+            "opportunities": autonomy.get("opportunities", []),
+            "suggestion": autonomy.get("primary_suggestion", "idle"),
+            "idle_level": autonomy.get("idle_level", "medium")
+        }
+
     # Ultra compact mode for very low token use
     if compact:
         return {

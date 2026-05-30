@@ -101,6 +101,19 @@ forage() {
   echo "{\"commands\":[{\"action\":\"forage\",\"radius\":$radius}]}" > "$COMMANDS"
 }
 
+# Autonomy layer (high-level, token-light)
+start_autonomy() {
+  echo "{\"commands\":[{\"action\":\"start_autonomy\"}]}" > "$COMMANDS"
+}
+
+stop_autonomy() {
+  echo "{\"commands\":[{\"action\":\"stop_autonomy\"}]}" > "$COMMANDS"
+}
+
+autonomous_water() {
+  echo "{\"commands\":[{\"action\":\"autonomous_water\"}]}" > "$COMMANDS"
+}
+
 # === Chat feature (crucial for natural play with human) ===
 chat() {
   local message="$*"
@@ -201,7 +214,10 @@ case "$1" in
   perceive) perceive "$@" ;;
   chest_deposit)  chest_deposit "$2" "$3" "$4" ;;
   chest_withdraw) chest_withdraw "$2" "$3" "$4" ;;
-  forage)   forage "$2" ;;
+  forage)          forage "$2" ;;
+  start_autonomy)  start_autonomy ;;
+  stop_autonomy)   stop_autonomy ;;
+  autonomous_water) autonomous_water ;;
   chat)     chat "$@" ;;
   recent_chat) recent_chat ;;
   start_direct_chat) start_direct_chat ;;
@@ -220,7 +236,7 @@ case "$1" in
   kb_combo) kb_combo "$2" ;;
   kb_close) kb_close ;;
   *)
-    echo "Usage: $0 {move|emote|dialogue|gift|wait|transition|nearest_exit|summary|compact|perceive|chest_deposit|chest_withdraw|forage|chat|recent_chat|start_direct_chat|clear|state|get|getnum|nearby|raploc|raw|kb_key|kb_keys|kb_type|kb_hold|kb_release|kb_combo|kb_close}"
+    echo "Usage: $0 {move|emote|dialogue|gift|wait|transition|nearest_exit|summary|compact|perceive|chest_deposit|chest_withdraw|forage|start_autonomy|stop_autonomy|autonomous_water|chat|recent_chat|start_direct_chat|clear|state|get|getnum|nearby|raploc|raw|kb_key|kb_keys|kb_type|kb_hold|kb_release|kb_combo|kb_close}"
     echo ""
     echo "Mod commands (JSON bridge):"
     echo "  move <tileX> <tileY>    Move Lyra farmer to tile"
@@ -236,6 +252,9 @@ case "$1" in
     echo "  chest_deposit <item> <x> <y>   Deposit item into chest at coordinates"
     echo "  chest_withdraw <item> <x> <y>  Withdraw item from chest at coordinates"
     echo "  forage [radius]         Forage in an area around current position (default radius 5)"
+    echo "  start_autonomy          Let Lyra decide what to do on her own"
+    echo "  stop_autonomy           Return to fully prompted control"
+    echo "  autonomous_water        High-level: water nearby crops without micromanagement"
     echo "  chat \"message\"        Send a message in multiplayer chat (main way to talk to Raphtalia)"
     echo "  recent_chat             Show the last few messages from chat_in.json (low token)"
     echo "  start_direct_chat       Launch bidirectional bridge (game chat ↔ Lyra's main OpenClaw session)"
