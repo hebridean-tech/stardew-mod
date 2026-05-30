@@ -43,6 +43,18 @@ namespace LyraAI
         private DateTime _lastPersonalityEmote = DateTime.UtcNow;
         private readonly HashSet<string> _prevNearbyNames = new(); // for reactive emotes on player enter/leave
 
+        // Area transition support (Phase 1.5) — deepened
+        private Dictionary<string, List<dynamic>> _exitsByLocation = new(); // Better per-location caching
+        private List<dynamic> _cachedExits = new(); // Convenience reference to current location's exits
+        private string _lastLocationWithExits = "";
+        private int _transitionCooldown = 0; // Prevents rapid repeated exit pathing attempts
+
+        // Stuck detection for transitions (high priority reliability work)
+        private Vector2 _lastTransitionPosition = Vector2.Zero;
+        private int _ticksWithoutTransitionProgress = 0;
+        private const int STUCK_THRESHOLD_TICKS = 60; // ~4 seconds at 15 updates/sec (every 4th tick)
+        private bool _isAttemptingTransition = false;
+
         // Follow command state
         private string _following = null; // target farmer name, null = not following
 
@@ -109,6 +121,12 @@ namespace LyraAI
             _pauseTicks = 0;
             _lastPersonalityEmote = DateTime.UtcNow;
             _prevNearbyNames.Clear();
+            _exitsByLocation.Clear();
+            _cachedExits.Clear();
+            _lastLocationWithExits = "";
+            _transitionCooldown = 0;
+            _ticksWithoutTransitionProgress = 0;
+            _isAttemptingTransition = false;
         }
 
         private void EnsureFile(string path, string defaultContent)
@@ -352,6 +370,17 @@ namespace LyraAI
                 }
 
                 Monitor.Log("Could not find chat send method on multiplayer", LogLevel.Warn);
+
+                // Last-ditch fallback: try adding directly to the local chat box (visible at least locally)
+                if (Game1.chatBox != null)
+                {
+                    try
+                    {
+                        Game1.chatBox.addMessage(message, Color.White);
+                        Monitor.Log($"Chat (local fallback): {message}", LogLevel.Debug);
+                    }
+                    catch { }
+                }
             }
             catch (Exception ex)
             {
@@ -434,6 +463,18 @@ namespace LyraAI
                             case "stop":
                                 HandleStop(cmd);
                                 break;
+                            case "transition":
+                                HandleTransition(cmd);
+                                break;
+                            case "chest_deposit":
+                                HandleChestDeposit(cmd);
+                                break;
+                            case "chest_withdraw":
+                                HandleChestWithdraw(cmd);
+                                break;
+                            case "forage":
+                                HandleForage(cmd);
+                                break;
                             case "waitforevent":
                                 // No-op: just resets idle timer
                                 break;
@@ -463,6 +504,27 @@ namespace LyraAI
             if (tx < 0 || ty < 0) return;
 
             _following = null; // Stop following if explicitly moving
+
+            // Phase 1.5: If the target tile is far outside current map, try to use an exit instead
+            var location = Game1.currentLocation;
+            if (location?.map != null && _cachedExits.Count > 0)
+            {
+                int mapWidth = location.map.Layers[0].LayerWidth;
+                int mapHeight = location.map.Layers[0].LayerHeight;
+
+                bool targetIsOffMap = tx < -2 || ty < -2 || tx > mapWidth + 2 || ty > mapHeight + 2;
+
+                if (targetIsOffMap)
+                {
+                    // Try to find any reasonable exit to help the player leave the map
+                    if (TryPathTowardExitForLocation("")) // empty string = any exit
+                    {
+                        Monitor.Log($"[MOVE] Target ({tx},{ty}) is off-map. Using exit pathing instead.", LogLevel.Debug);
+                        return;
+                    }
+                }
+            }
+
             _moveTarget = new Vector2(tx, ty);
             _isMoving = true;
             _pathFailed = false;
@@ -929,8 +991,9 @@ namespace LyraAI
         private void HandleChat(JsonElement cmd)
         {
             string message = cmd.TryGetProperty("text", out var tE) ? tE.GetString() : null;
-            if (string.IsNullOrEmpty(message)) return;
+            if (string.IsNullOrWhiteSpace(message)) return;
 
+            message = message.Trim();
             SendChatMessage(message);
         }
 
@@ -978,6 +1041,8 @@ namespace LyraAI
 
             _isMoving = false;
             _pathFailed = false;
+            _isAttemptingTransition = false;
+            _ticksWithoutTransitionProgress = 0;
             if (Game1.player != null)
             {
                 Game1.player.movementDirections?.Clear();
@@ -986,6 +1051,227 @@ namespace LyraAI
             _multiHitCts?.Cancel();
 
             Monitor.Log("Stopped", LogLevel.Debug);
+        }
+
+        // ─── Transition Command (Phase 1.5) ───
+        private void HandleTransition(JsonElement cmd)
+        {
+            string targetLocation = cmd.TryGetProperty("targetLocation", out var tE) ? tE.GetString() ?? "" : "";
+            int exitIndex = cmd.TryGetProperty("exitIndex", out var eE) ? eE.GetInt32() : -1;
+
+            if (string.IsNullOrEmpty(targetLocation) && exitIndex < 0)
+            {
+                Monitor.Log("Transition command requires either targetLocation or exitIndex", LogLevel.Warn);
+                return;
+            }
+
+            if (_cachedExits == null || _cachedExits.Count == 0)
+            {
+                Monitor.Log("No cached exits available for transition", LogLevel.Warn);
+                return;
+            }
+
+            dynamic? chosenExit = null;
+
+            if (exitIndex >= 0 && exitIndex < _cachedExits.Count)
+            {
+                chosenExit = _cachedExits[exitIndex];
+            }
+            else if (!string.IsNullOrEmpty(targetLocation))
+            {
+                // Find best matching exit
+                foreach (var ex in _cachedExits)
+                {
+                    if ((ex.targetLocation?.ToString() ?? "").Equals(targetLocation, StringComparison.OrdinalIgnoreCase))
+                    {
+                        chosenExit = ex;
+                        break;
+                    }
+                }
+
+                // Fallback to first exit if no perfect match
+                if (chosenExit == null) chosenExit = _cachedExits[0];
+            }
+
+            if (chosenExit != null)
+            {
+                int tx = (int)chosenExit.x;
+                int ty = (int)chosenExit.y;
+
+                _following = null;
+                _moveTarget = new Vector2(tx, ty);
+                _isMoving = true;
+                _pathFailed = false;
+
+                TrySetPath(new Point(tx, ty));
+                Monitor.Log($"Transition command: Pathing to exit ({tx},{ty}) → {chosenExit.targetLocation}", LogLevel.Debug);
+            }
+        }
+
+        // ─── Chest Interaction (Phase 3 - Agency with minimal token cost) ───
+        private void HandleChestDeposit(JsonElement cmd)
+        {
+            if (!Context.IsWorldReady || Game1.player == null) return;
+
+            string itemName = cmd.TryGetProperty("itemName", out var iE) ? iE.GetString() : null;
+            int chestX = cmd.TryGetProperty("chestX", out var cxE) ? cxE.GetInt32() : -1;
+            int chestY = cmd.TryGetProperty("chestY", out var cyE) ? cyE.GetInt32() : -1;
+
+            if (string.IsNullOrEmpty(itemName) || chestX < 0 || chestY < 0) return;
+
+            var player = Game1.player;
+            var location = Game1.currentLocation;
+            var tilePos = new Vector2(chestX, chestY);
+
+            if (!location.Objects.TryGetValue(tilePos, out var obj) || obj is not StardewValley.Objects.Chest chest)
+            {
+                Monitor.Log($"No chest found at ({chestX},{chestY})", LogLevel.Warn);
+                return;
+            }
+
+            // Find item in player inventory
+            for (int i = 0; i < player.Items.Count; i++)
+            {
+                var item = player.Items[i];
+                if (item != null && item.DisplayName.Equals(itemName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (chest.addItem(item) != null)
+                    {
+                        Monitor.Log($"Chest at ({chestX},{chestY}) is full or rejected item", LogLevel.Warn);
+                        return;
+                    }
+
+                    player.Items[i] = null; // Remove from player
+                    Monitor.Log($"Deposited {itemName} into chest at ({chestX},{chestY})", LogLevel.Debug);
+                    return;
+                }
+            }
+
+            Monitor.Log($"Item '{itemName}' not found in inventory", LogLevel.Warn);
+        }
+
+        private void HandleChestWithdraw(JsonElement cmd)
+        {
+            if (!Context.IsWorldReady || Game1.player == null) return;
+
+            string itemName = cmd.TryGetProperty("itemName", out var iE) ? iE.GetString() : null;
+            int chestX = cmd.TryGetProperty("chestX", out var cxE) ? cxE.GetInt32() : -1;
+            int chestY = cmd.TryGetProperty("chestY", out var cyE) ? cyE.GetInt32() : -1;
+
+            if (string.IsNullOrEmpty(itemName) || chestX < 0 || chestY < 0) return;
+
+            var player = Game1.player;
+            var location = Game1.currentLocation;
+            var tilePos = new Vector2(chestX, chestY);
+
+            if (!location.Objects.TryGetValue(tilePos, out var obj) || obj is not StardewValley.Objects.Chest chest)
+            {
+                Monitor.Log($"No chest found at ({chestX},{chestY})", LogLevel.Warn);
+                return;
+            }
+
+            if (chest.Items == null) return;
+
+            for (int i = 0; i < chest.Items.Count; i++)
+            {
+                var item = chest.Items[i];
+                if (item != null && item.DisplayName.Equals(itemName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (player.addItemToInventoryBool(item))
+                    {
+                        chest.Items[i] = null;
+                        Monitor.Log($"Withdrew {itemName} from chest at ({chestX},{chestY})", LogLevel.Debug);
+                    }
+                    else
+                    {
+                        Monitor.Log("Player inventory full", LogLevel.Warn);
+                    }
+                    return;
+                }
+            }
+
+            Monitor.Log($"Item '{itemName}' not found in chest", LogLevel.Warn);
+        }
+
+        // ─── Forage Command (Phase 3 - Agency) ───
+        private void HandleForage(JsonElement cmd)
+        {
+            if (!Context.IsWorldReady || Game1.player == null || Game1.currentLocation == null) return;
+
+            var player = Game1.player;
+            var location = Game1.currentLocation;
+            int radius = cmd.TryGetProperty("radius", out var rE) ? Math.Max(1, rE.GetInt32()) : 5;
+
+            int tx = (int)(player.Position.X / Game1.tileSize);
+            int ty = (int)(player.Position.Y / Game1.tileSize);
+
+            int pickedUp = 0;
+
+            // Scan a square area
+            for (int dx = -radius; dx <= radius; dx++)
+            {
+                for (int dy = -radius; dy <= radius; dy++)
+                {
+                    int cx = tx + dx;
+                    int cy = ty + dy;
+                    var tilePos = new Vector2(cx, cy);
+
+                    // Try picking up objects
+                    if (location.Objects.TryGetValue(tilePos, out var obj) && obj != null)
+                    {
+                        if (player.couldInventoryAcceptThisItem(obj))
+                        {
+                            location.Objects.Remove(tilePos);
+                            player.addItemToInventory(obj);
+                            pickedUp++;
+                        }
+                    }
+
+                    // Try picking up debris (forage)
+                    var debrisField = typeof(GameLocation).GetField("debris",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    var debrisList = debrisField?.GetValue(location) as System.Collections.IList;
+
+                    if (debrisList != null)
+                    {
+                        for (int i = debrisList.Count - 1; i >= 0; i--)
+                        {
+                            var debris = debrisList[i];
+                            if (debris == null) continue;
+
+                            var debrisType = debris.GetType();
+                            var posProp = debrisType.GetProperty("Position", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                                         ?? debrisType.GetProperty("position", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                            if (posProp == null) continue;
+
+                            var pos = posProp.GetValue(debris) as Vector2?;
+                            if (!pos.HasValue) continue;
+
+                            int dtx = (int)(pos.Value.X / Game1.tileSize);
+                            int dty = (int)(pos.Value.Y / Game1.tileSize);
+
+                            if (Math.Abs(dtx - cx) <= 1 && Math.Abs(dty - cy) <= 1)
+                            {
+                                var itemField = debrisType.GetField("item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                                var debrisItem = itemField?.GetValue(debris) as Item;
+
+                                if (debrisItem != null && player.couldInventoryAcceptThisItem(debrisItem))
+                                {
+                                    player.addItemToInventory(debrisItem);
+                                    itemField.SetValue(debris, null);
+                                    debrisList.RemoveAt(i);
+                                    pickedUp++;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (pickedUp > 0)
+                Monitor.Log($"Foraged {pickedUp} items in radius {radius}", LogLevel.Debug);
+            else
+                Monitor.Log("Nothing to forage nearby", LogLevel.Trace);
         }
 
         // ─── Dialogue Polling (every 2s) ───
@@ -1129,17 +1415,29 @@ namespace LyraAI
                         {
                             if (location.warps != null)
                             {
+                                var freshExits = new List<dynamic>();
                                 foreach (var w in location.warps)
                                 {
-                                    exits.Add(new
+                                    var exitInfo = new
                                     {
                                         x = w.X,
                                         y = w.Y,
                                         targetLocation = w.TargetName,
                                         targetX = w.TargetX,
                                         targetY = w.TargetY
-                                    });
+                                    };
+                                    freshExits.Add(exitInfo);
+                                    exits.Add(exitInfo);
                                     if (exits.Count >= 8) break;
+                                }
+
+                                // Cache for use in movement logic (so we can act on exits without waiting for next state write)
+                                if (freshExits.Count > 0)
+                                {
+                                    string locName = location.Name ?? "";
+                                    _exitsByLocation[locName] = freshExits;
+                                    _cachedExits = freshExits;
+                                    _lastLocationWithExits = locName;
                                 }
                             }
                         }
@@ -1181,7 +1479,18 @@ namespace LyraAI
                         exits,  // warp/exit points for area transitions (Phase 1)
                         scannedLocation = location?.Name ?? "Unknown",
                         cropCount = unwateredCrops.Count,
-                        exitCount = exits.Count
+                        exitCount = exits.Count,
+                        // New transition awareness fields (Phase 1.5)
+                        nearestExit = _cachedExits.Count > 0 ? _cachedExits[0] : null,
+                        isNearMapEdge = _cachedExits.Count > 0 && IsNearAnyExit(player.Position / Game1.tileSize),
+                        distanceToNearestExit = _cachedExits.Count > 0 ? CalculateDistanceToNearestExit(player.Position / Game1.tileSize) : -1,
+                        transitionStatus = _transitionCooldown > 0 ? "on_cooldown" : (_cachedExits.Count > 0 ? "exits_available" : "no_exits"),
+                        isStuckOnTransition = _isAttemptingTransition && _ticksWithoutTransitionProgress > 20,
+                        transitionStuckTicks = _ticksWithoutTransitionProgress,
+                        // New: Very lightweight chest info for agency (minimal token impact)
+                        nearbyChests = GetNearbyChestsSummary(location, player.Position / Game1.tileSize),
+                        // New: Lightweight foraging info (for agency with minimal tokens)
+                        forage = GetForageSummary(location, player.Position / Game1.tileSize)
                     }
                 };
 
@@ -1226,28 +1535,51 @@ namespace LyraAI
 
                 if (target != null && target.currentLocation != null)
                 {
-                    // Move to target's location if different (CRITICAL: warpFarmer can cause visual desync for host in MP)
-                    // TODO Phase1: replace with "walk to map edge + normal transition" for production reliability
+                    // Move to target's location if different
                     if (player.currentLocation != target.currentLocation)
                     {
-                        Monitor.Log($"[FOLLOW] Cross-location warp to follow '{_following}' into {target.currentLocation.Name} (possible host desync risk)", LogLevel.Warn);
-                        try
+                        string targetLocName = target.currentLocation.Name ?? "";
+
+                        // Mark that we are now attempting a cross-location transition
+                        _isAttemptingTransition = true;
+                        _lastTransitionPosition = player.Position / Game1.tileSize;
+                        _ticksWithoutTransitionProgress = 0;
+
+                        // Strongly prefer exit pathing over warping
+                        bool usedExitPathing = TryPathTowardExitForLocation(targetLocName);
+
+                        // If no perfect match was found, try the closest exit as a last non-warp attempt
+                        if (!usedExitPathing && _cachedExits.Count > 0)
                         {
-                            Game1.warpFarmer(
-                                target.currentLocation.Name ?? "Farm",
-                                (int)(target.Position.X / Game1.tileSize),
-                                (int)(target.Position.Y / Game1.tileSize),
-                                false
-                            );
-                            // Clear movement state post-warp to let game settle
-                            player.movementDirections?.Clear();
-                            player.controller = null;
-                            _isMoving = false;
-                            _pathCooldown = 8; // brief pause after warp
+                            usedExitPathing = TryPathTowardClosestExit();
                         }
-                        catch (Exception warpEx)
+
+                        if (!usedExitPathing)
                         {
-                            Monitor.Log($"Follow warp failed: {warpEx.Message}", LogLevel.Warn);
+                            // Last resort warp (we really tried to avoid this)
+                            Monitor.Log($"[FOLLOW] All exit pathing attempts failed - LAST RESORT warpFarmer to {targetLocName} (desync risk)", LogLevel.Warn);
+                            try
+                            {
+                                Game1.warpFarmer(
+                                    targetLocName,
+                                    (int)(target.Position.X / Game1.tileSize),
+                                    (int)(target.Position.Y / Game1.tileSize),
+                                    false
+                                );
+                                player.movementDirections?.Clear();
+                                player.controller = null;
+                                _isMoving = false;
+                                _pathCooldown = 8;
+                                _isAttemptingTransition = false;
+                            }
+                            catch (Exception warpEx)
+                            {
+                                Monitor.Log($"Follow warp failed: {warpEx.Message}", LogLevel.Warn);
+                            }
+                        }
+                        else
+                        {
+                            Monitor.Log($"[FOLLOW] Using exit pathing to reach {targetLocName}", LogLevel.Debug);
                         }
                     }
 
@@ -1275,6 +1607,7 @@ namespace LyraAI
                         _isMoving = false;
                         player.movementDirections.Clear();
                         player.controller = null;
+                        _isAttemptingTransition = false; // successfully reached target area
                         // Natural: face the player when standing nearby (personality)
                         try
                         {
@@ -1303,6 +1636,37 @@ namespace LyraAI
             // ── Movement (follow or explicit move command) + natural personality ──
             if (_isMoving)
             {
+                // Phase 1.5: Proactive edge detection — if we're moving and getting close to map edge, consider switching to exit pathing
+                if (_transitionCooldown == 0 && _cachedExits.Count > 0)
+                {
+                    Vector2 currentTile = player.Position / Game1.tileSize;
+                    var location = Game1.currentLocation;
+                    if (location?.map != null)
+                    {
+                        int w = location.map.Layers[0].LayerWidth;
+                        int h = location.map.Layers[0].LayerHeight;
+
+                        bool nearEdge = currentTile.X < 3 || currentTile.Y < 3 || currentTile.X > w - 4 || currentTile.Y > h - 4;
+
+                        if (nearEdge)
+                        {
+                            // Mark transition attempt for stuck detection
+                            if (!_isAttemptingTransition)
+                            {
+                                _isAttemptingTransition = true;
+                                _lastTransitionPosition = currentTile;
+                                _ticksWithoutTransitionProgress = 0;
+                            }
+
+                            // Try to switch to a good exit instead of walking into the void
+                            if (TryPathTowardExitForLocation(""))
+                            {
+                                Monitor.Log("[TRANSITION] Detected near map edge while moving — switched to exit pathing", LogLevel.Debug);
+                            }
+                        }
+                    }
+                }
+
                 // Natural pause/hesitation (Phase 1 personality): occasionally stop for a few ticks
                 if (_pauseTicks > 0)
                 {
@@ -1353,6 +1717,12 @@ namespace LyraAI
 
             // Decrement pathfinding cooldown
             if (_pathCooldown > 0) _pathCooldown--;
+
+            // Decrement transition cooldown (prevents spamming exit pathing)
+            if (_transitionCooldown > 0) _transitionCooldown--;
+
+            // Run stuck detection for transitions (crucial for reliability)
+            UpdateTransitionStuckDetection();
 
             // ── Idle behavior: random emote every 60 seconds ──
             if (!_isMoving && _following == null)
@@ -1433,6 +1803,443 @@ namespace LyraAI
             if (Math.Abs(delta.X) > Math.Abs(delta.Y))
                 return delta.X > 0 ? 1 : 3;
             return delta.Y > 0 ? 2 : 0;
+        }
+
+        /// <summary>
+        /// Phase 1.5 Area Transitions: Attempts to path toward a good exit that leads toward the target location.
+        /// Returns true if it successfully started pathing toward an exit (or handled being near one).
+        /// </summary>
+        private bool TryPathTowardExitForLocation(string targetLocationName)
+        {
+            if (_transitionCooldown > 0) return false; // Respect cooldown to avoid spam
+
+            if (string.IsNullOrEmpty(targetLocationName)) return false;
+
+            // Prefer exits from the dictionary for the current location if available
+            var location = Game1.currentLocation;
+            string currentLoc = location?.Name ?? "";
+            if (_exitsByLocation.ContainsKey(currentLoc) && _exitsByLocation[currentLoc].Count > 0)
+            {
+                _cachedExits = _exitsByLocation[currentLoc];
+            }
+
+            if (_cachedExits == null || _cachedExits.Count == 0) return false;
+
+            var player = Game1.player;
+            if (player == null) return false;
+
+            dynamic? bestExit = null;
+            double bestScore = double.MaxValue;
+
+            Vector2 currentTile = player.Position / Game1.tileSize;
+
+            foreach (var ex in _cachedExits)
+            {
+                string targetLoc = ex.targetLocation?.ToString() ?? "";
+                int exX = (int)ex.x;
+                int exY = (int)ex.y;
+
+                double distance = Math.Sqrt(Math.Pow(currentTile.X - exX, 2) + Math.Pow(currentTile.Y - exY, 2));
+
+                // Strongly prefer exits that match the exact target location
+                double score = distance;
+                if (!string.IsNullOrEmpty(targetLoc) && targetLoc.Equals(targetLocationName, StringComparison.OrdinalIgnoreCase))
+                {
+                    score = distance * 0.25; // very strong preference for correct destination
+                }
+                else if (distance < 3.0)
+                {
+                    // Any exit we're already close to is attractive as a fallback
+                    score = distance * 0.6;
+                }
+
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestExit = ex;
+                }
+            }
+
+            if (bestExit != null)
+            {
+                int tx = (int)bestExit.x;
+                int ty = (int)bestExit.y;
+                string exitTarget = bestExit.targetLocation?.ToString() ?? "unknown";
+
+                float distToExit = Vector2.Distance(currentTile, new Vector2(tx, ty));
+
+                // If we're very close to a good exit, stop and let the game naturally transition
+                if (distToExit < 1.8f)
+                {
+                    Monitor.Log($"[TRANSITION] Close to exit ({tx},{ty}) → {exitTarget}. Releasing control for natural transition.", LogLevel.Debug);
+                    _isMoving = false;
+                    player.movementDirections?.Clear();
+                    player.controller = null;
+
+                    // Gentle nudge in the direction of the exit to help trigger the transition
+                    if (distToExit > 0.6f)
+                    {
+                        Vector2 dir = new Vector2(tx, ty) - currentTile;
+                        player.movementDirections.Clear();
+                        if (Math.Abs(dir.X) > Math.Abs(dir.Y))
+                            player.movementDirections.Add(dir.X > 0 ? 1 : 3);
+                        else
+                            player.movementDirections.Add(dir.Y > 0 ? 2 : 0);
+                    }
+
+                    _transitionCooldown = 12; // short cooldown after handling near-exit
+                    return true;
+                }
+
+                // Otherwise, path toward the exit
+                _moveTarget = new Vector2(tx, ty);
+                _isMoving = true;
+                _pathFailed = false;
+                TrySetPath(new Point(tx, ty));
+
+                Monitor.Log($"[TRANSITION] Pathing toward exit ({tx},{ty}) → {exitTarget} (score {bestScore:F1})", LogLevel.Debug);
+                _transitionCooldown = 8; // brief cooldown after starting exit pathing
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Phase 1.5 Hardening: Path toward the single closest exit, regardless of destination.
+        /// Used as a last-ditch attempt before falling back to warpFarmer.
+        /// </summary>
+        private bool TryPathTowardClosestExit()
+        {
+            if (_transitionCooldown > 0) return false;
+            if (_cachedExits == null || _cachedExits.Count == 0) return false;
+
+            var player = Game1.player;
+            if (player == null) return false;
+
+            Vector2 currentTile = player.Position / Game1.tileSize;
+            dynamic? closest = null;
+            double closestDist = double.MaxValue;
+
+            foreach (var ex in _cachedExits)
+            {
+                int exX = (int)ex.x;
+                int exY = (int)ex.y;
+                double dist = Math.Sqrt(Math.Pow(currentTile.X - exX, 2) + Math.Pow(currentTile.Y - exY, 2));
+
+                if (dist < closestDist)
+                {
+                    closestDist = dist;
+                    closest = ex;
+                }
+            }
+
+            if (closest != null)
+            {
+                int tx = (int)closest.x;
+                int ty = (int)closest.y;
+
+                // If already very close, help the transition instead of pathing
+                if (closestDist < 2.0f)
+                {
+                    Monitor.Log($"[TRANSITION] Very close to nearest exit ({tx},{ty}) → {closest.targetLocation}. Helping cross.", LogLevel.Debug);
+                    _isMoving = false;
+                    player.movementDirections?.Clear();
+                    player.controller = null;
+
+                    // Stronger nudge toward the exit
+                    Vector2 dir = new Vector2(tx, ty) - currentTile;
+                    if (Math.Abs(dir.X) > Math.Abs(dir.Y))
+                        player.movementDirections.Add(dir.X > 0 ? 1 : 3);
+                    else
+                        player.movementDirections.Add(dir.Y > 0 ? 2 : 0);
+
+                    _transitionCooldown = 10;
+                    return true;
+                }
+
+                _moveTarget = new Vector2(tx, ty);
+                _isMoving = true;
+                _pathFailed = false;
+                TrySetPath(new Point(tx, ty));
+
+                Monitor.Log($"[TRANSITION] Falling back to closest exit at ({tx},{ty}) → {closest.targetLocation}", LogLevel.Debug);
+                _transitionCooldown = 6;
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Tracks whether we are making progress toward an exit/transition.
+        /// Called regularly when we are in "trying to cross" mode.
+        /// </summary>
+        private void UpdateTransitionStuckDetection()
+        {
+            if (!_isAttemptingTransition) return;
+
+            var player = Game1.player;
+            if (player == null) return;
+
+            Vector2 currentTile = player.Position / Game1.tileSize;
+
+            float distanceMoved = Vector2.Distance(currentTile, _lastTransitionPosition);
+
+            if (distanceMoved > 0.8f) // made decent progress
+            {
+                _ticksWithoutTransitionProgress = 0;
+                _lastTransitionPosition = currentTile;
+            }
+            else
+            {
+                _ticksWithoutTransitionProgress++;
+            }
+
+            // Stuck detection triggered
+            if (_ticksWithoutTransitionProgress >= STUCK_THRESHOLD_TICKS)
+            {
+                Monitor.Log($"[STUCK] No meaningful progress toward exit for {STUCK_THRESHOLD_TICKS / 15f:F1}s. Triggering recovery.", LogLevel.Warn);
+
+                HandleStuckTransitionRecovery();
+                _ticksWithoutTransitionProgress = 0; // reset after recovery attempt
+            }
+        }
+
+        /// <summary>
+        /// Recovery behavior when stuck trying to reach an exit while following or moving.
+        /// </summary>
+        private void HandleStuckTransitionRecovery()
+        {
+            var player = Game1.player;
+            if (player == null) return;
+
+            // Strategy 1: If we have multiple exits, try switching to a completely different one
+            if (_cachedExits.Count >= 2)
+            {
+                // Pick a different exit than the current target
+                Vector2 currentTarget = _moveTarget;
+
+                dynamic? alternative = null;
+                foreach (var ex in _cachedExits)
+                {
+                    int exX = (int)ex.x;
+                    int exY = (int)ex.y;
+                    if (Math.Abs(exX - currentTarget.X) > 1 || Math.Abs(exY - currentTarget.Y) > 1)
+                    {
+                        alternative = ex;
+                        break;
+                    }
+                }
+
+                if (alternative != null)
+                {
+                    int tx = (int)alternative.x;
+                    int ty = (int)alternative.y;
+                    _moveTarget = new Vector2(tx, ty);
+                    TrySetPath(new Point(tx, ty));
+                    Monitor.Log($"[STUCK RECOVERY] Switching to alternative exit ({tx},{ty})", LogLevel.Warn);
+                    _transitionCooldown = 4;
+                    return;
+                }
+            }
+
+            // Strategy 2: Clear everything and try the absolute closest exit with more aggressive behavior
+            if (_cachedExits.Count > 0)
+            {
+                TryPathTowardClosestExit();
+                _transitionCooldown = 3;
+                Monitor.Log("[STUCK RECOVERY] Forcing closest exit pathing with fresh attempt", LogLevel.Warn);
+                return;
+            }
+
+            // Strategy 3: Last resort - if truly stuck with no exits, clear state and let higher level decide
+            Monitor.Log("[STUCK RECOVERY] No viable exits found. Clearing movement. AI should issue new commands or allow warp.", LogLevel.Warn);
+            _isMoving = false;
+            player.movementDirections?.Clear();
+            player.controller = null;
+            _isAttemptingTransition = false;
+        }
+
+        /// <summary>
+        /// Returns true if the player is close enough to any cached exit that a transition is likely.
+        /// </summary>
+        private bool IsNearAnyExit(Vector2 playerTile)
+        {
+            if (_cachedExits == null || _cachedExits.Count == 0) return false;
+
+            foreach (var ex in _cachedExits)
+            {
+                int exX = (int)ex.x;
+                int exY = (int)ex.y;
+                float dist = Vector2.Distance(playerTile, new Vector2(exX, exY));
+                if (dist <= 2.5f) // within ~2.5 tiles of an exit
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Returns the distance (in tiles) to the nearest cached exit, or -1 if none available.
+        /// </summary>
+        private double CalculateDistanceToNearestExit(Vector2 playerTile)
+        {
+            if (_cachedExits == null || _cachedExits.Count == 0) return -1;
+
+            double minDist = double.MaxValue;
+
+            foreach (var ex in _cachedExits)
+            {
+                int exX = (int)ex.x;
+                int exY = (int)ex.y;
+                double dist = Math.Sqrt(Math.Pow(playerTile.X - exX, 2) + Math.Pow(playerTile.Y - exY, 2));
+                if (dist < minDist) minDist = dist;
+            }
+
+            return minDist;
+        }
+
+        /// <summary>
+        /// Returns very lightweight summary of nearby chests for agency (designed for token efficiency).
+        /// Only reports position + high-level category. Full details go through Python summarizer.
+        /// </summary>
+        private List<object> GetNearbyChestsSummary(GameLocation location, Vector2 playerTile)
+        {
+            var result = new List<object>();
+            if (location?.Objects == null) return result;
+
+            try
+            {
+                foreach (var kv in location.Objects.Pairs)
+                {
+                    if (kv.Value is StardewValley.Objects.Chest chest)
+                    {
+                        int cx = (int)kv.Key.X;
+                        int cy = (int)kv.Key.Y;
+                        float dist = Vector2.Distance(playerTile, new Vector2(cx, cy));
+
+                        if (dist <= 8) // Only nearby chests
+                        {
+                            // Very high-level categorization to keep tokens low
+                            string summary = "mixed";
+                            int itemCount = chest.Items?.Count ?? 0;
+
+                            if (itemCount == 0) summary = "empty";
+                            else
+                            {
+                                bool hasTools = false, hasCrops = false, hasSeeds = false;
+                                foreach (var item in chest.Items)
+                                {
+                                    if (item == null) continue;
+                                    string name = item.DisplayName.ToLower();
+                                    if (name.Contains("axe") || name.Contains("hoe") || name.Contains("pickaxe") || name.Contains("watering"))
+                                        hasTools = true;
+                                    if (name.Contains("parsnip") || name.Contains("potato") || name.Contains("cauliflower") || name.Contains("crop"))
+                                        hasCrops = true;
+                                    if (name.Contains("seed"))
+                                        hasSeeds = true;
+                                }
+                                if (hasTools) summary = "tools";
+                                else if (hasSeeds) summary = "seeds";
+                                else if (hasCrops) summary = "crops";
+                            }
+
+                            result.Add(new
+                            {
+                                x = cx,
+                                y = cy,
+                                distance = Math.Round(dist, 1),
+                                summary
+                            });
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Returns very lightweight foraging summary for agency (designed for token efficiency).
+        /// Only count + rough type. No full lists of positions.
+        /// </summary>
+        private object GetForageSummary(GameLocation location, Vector2 playerTile)
+        {
+            if (location == null) return new { count = 0, summary = "none" };
+
+            int count = 0;
+            var types = new HashSet<string>();
+
+            try
+            {
+                // Check ground objects (some forageables appear as objects)
+                foreach (var kv in location.Objects.Pairs)
+                {
+                    var obj = kv.Value;
+                    if (obj == null) continue;
+
+                    float dist = Vector2.Distance(playerTile, kv.Key);
+                    if (dist > 6) continue; // small radius for token reasons
+
+                    // Forageables are often not tools/weapons and can be picked up
+                    if (!(obj is Tool) && !(obj is StardewValley.Objects.Chest) && !(obj is StardewValley.Objects.IndoorPot))
+                    {
+                        count++;
+                        string name = obj.DisplayName?.ToLower() ?? "unknown";
+                        if (name.Contains("daffodil") || name.Contains("dandelion")) types.Add("flowers");
+                        else if (name.Contains("leek") || name.Contains("horseradish") || name.Contains("spring onion")) types.Add("spring veggies");
+                        else if (name.Contains("morel") || name.Contains("mushroom")) types.Add("mushrooms");
+                        else types.Add("misc");
+                    }
+                }
+
+                // Check debris (main source of forage)
+                var debrisField = typeof(GameLocation).GetField("debris",
+                    BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                var debrisList = debrisField?.GetValue(location) as System.Collections.IList;
+
+                if (debrisList != null)
+                {
+                    foreach (var d in debrisList)
+                    {
+                        if (d == null) continue;
+
+                        var debrisType = d.GetType();
+                        var posProp = debrisType.GetProperty("Position", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                                     ?? debrisType.GetProperty("position", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        if (posProp == null) continue;
+
+                        var pos = posProp.GetValue(d) as Vector2?;
+                        if (!pos.HasValue) continue;
+
+                        float dist = Vector2.Distance(playerTile, pos.Value / Game1.tileSize);
+                        if (dist > 6) continue;
+
+                        var itemField = debrisType.GetField("item", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                        var item = itemField?.GetValue(d) as Item;
+                        if (item != null)
+                        {
+                            count++;
+                            string name = item.DisplayName?.ToLower() ?? "forage";
+                            if (name.Contains("daffodil") || name.Contains("dandelion")) types.Add("flowers");
+                            else if (name.Contains("leek") || name.Contains("horseradish") || name.Contains("spring onion")) types.Add("spring veggies");
+                            else if (name.Contains("morel") || name.Contains("mushroom")) types.Add("mushrooms");
+                            else if (name.Contains("wild")) types.Add("wild");
+                            else types.Add("misc");
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            string summary = types.Count > 0 ? string.Join(", ", types) : "none";
+
+            return new
+            {
+                count,
+                summary = count > 0 ? $"{count} forageables ({summary})" : "none nearby"
+            };
         }
 
         protected override void Dispose(bool disposing)
